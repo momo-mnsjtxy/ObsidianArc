@@ -304,8 +304,10 @@ func (a openAIAdapter) Chat(ctx context.Context, client *http.Client, p Provider
 		}
 		result.StreamFallbackReason = "the endpoint answered with " +
 			fallbackContentType(response.Header.Get("Content-Type")) + " instead of an event stream"
+		// Delivery may fail before the usage event reaches the gateway. The
+		// generation already completed, so its cost must survive that failure.
 		if err := emitAll(sink, result); err != nil {
-			return Result{}, err
+			return result, err
 		}
 		return result, nil
 	}
@@ -480,10 +482,11 @@ func (openAIAdapter) readStream(ctx context.Context, response *http.Response, si
 	// every delta, because the tag can straddle two of them. The counters
 	// below are how each event ends up carrying only what is new.
 	var (
-		content        strings.Builder
-		fieldReasoning strings.Builder
-		emittedAnswer  int
-		emittedInline  int
+		content         strings.Builder
+		fieldReasoning  strings.Builder
+		inlineReasoning string
+		emittedAnswer   int
+		emittedInline   int
 		// Kept across deltas rather than rebuilt per delta: see inlineThinking.
 		thinking inlineThinking
 		tools    toolCallAssembly
@@ -491,6 +494,10 @@ func (openAIAdapter) readStream(ctx context.Context, response *http.Response, si
 
 	flushContent := func(final bool) error {
 		inline, answer := thinking.split(content.String())
+		inlineReasoning = inline
+		// Keep received content even when the first delivery attempt fails.
+		result.Text = answer
+		result.Reasoning = fieldReasoning.String() + inline
 
 		// A trailing `<th` is not yet text — it may be the start of a tag.
 		// Holding it back until the next delta is what stops a stray `<th`
@@ -514,8 +521,6 @@ func (openAIAdapter) readStream(ctx context.Context, response *http.Response, si
 				return err
 			}
 		}
-		result.Text = answer
-		result.Reasoning = fieldReasoning.String() + inline
 		return nil
 	}
 
@@ -549,7 +554,9 @@ func (openAIAdapter) readStream(ctx context.Context, response *http.Response, si
 
 		if thought := firstNonEmpty(choice.Delta.ReasoningContent, choice.Delta.Reasoning); thought != "" {
 			fieldReasoning.WriteString(thought)
-			result.Reasoning = fieldReasoning.String()
+			// A field-only frame may fail before the next content flush. Its
+			// error result must retain the inline half already received.
+			result.Reasoning = fieldReasoning.String() + inlineReasoning
 			if err := sink(Event{Type: EventReasoning, Text: thought}); err != nil {
 				sinkErr = err
 				return err

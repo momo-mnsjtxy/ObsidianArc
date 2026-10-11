@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -308,41 +309,81 @@ func readErrorBody(response *http.Response) []byte {
 
 // --- server-sent events -----------------------------------------------------
 
-// readEventStream walks an SSE response, handing each `data:` payload to fn.
-//
-// Hand-rolled because both protocols use only the `data` field of the format,
-// and because the framing needs to tolerate `\r\n` as well as `\n`: some
-// proxies rewrite line endings, and a parser that only knows about `\n` sees
-// one enormous never-ending event.
-//
-// Returning an error from fn stops the read, which is how a disconnected
-// client ends an upstream generation.
+const maxEventBytes = 1024 * 1024
+
+// A protocol terminal ends a generation even when a proxy keeps the HTTP
+// response open. It is distinct from EOF so a sink's own error stays intact.
+var errEventStreamDone = errors.New("event stream complete")
+
+// readEventStream dispatches complete SSE data fields, joined at blank lines.
+// Splitting on data lines instead would silently drop a JSON object spread
+// over several lines. Both protocols put their event type inside that JSON,
+// so event, id and retry fields need no state here.
 func readEventStream(body io.Reader, fn func(data []byte) error) error {
 	scanner := bufio.NewScanner(body)
-	// A single event can carry a large reasoning delta; the default 64 KiB
-	// ceiling is not enough for every provider.
-	scanner.Buffer(make([]byte, 0, 16*1024), 1024*1024)
+	scanner.Split(splitEventLines)
+	scanner.Buffer(make([]byte, 0, 16*1024), maxEventBytes)
 
+	var data []byte
+	first := true
 	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
-		if line == "" || strings.HasPrefix(line, ":") {
+		line := scanner.Text()
+		if first {
+			line = strings.TrimPrefix(line, "\ufeff")
+			first = false
+		}
+		if line == "" {
+			if len(data) == 0 {
+				continue
+			}
+			payload := data[:len(data)-1]
+			if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
+				return nil
+			}
+			if err := fn(payload); err != nil {
+				if err == errEventStreamDone {
+					return nil
+				}
+				return err
+			}
+			data = data[:0]
 			continue
 		}
-		data, found := strings.CutPrefix(line, "data:")
-		if !found {
-			// `event:` and `id:` lines carry nothing either protocol needs;
-			// the payload itself names its own type.
+		field, value, _ := strings.Cut(line, ":")
+		if field != "data" {
 			continue
 		}
-		trimmed := strings.TrimSpace(data)
-		if trimmed == "" || trimmed == "[DONE]" {
-			continue
+		value = strings.TrimPrefix(value, " ")
+		// Bounding lines alone would let arbitrarily many short fields grow
+		// one event without limit. Include the joining newline in the budget.
+		if len(data)+len(value)+1 > maxEventBytes {
+			return &Error{Kind: ErrorUpstream, Message: "The provider returned an event that was too large."}
 		}
-		if err := fn([]byte(trimmed)); err != nil {
-			return err
-		}
+		data = append(data, value...)
+		data = append(data, '\n')
 	}
+	// EOF without a blank line is an incomplete event, not a dispatch.
 	return scanner.Err()
+}
+
+// SSE accepts CR, LF and CRLF. Waiting for the byte after a trailing CR keeps
+// a split CRLF from becoming two line endings and dispatching too early.
+func splitEventLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		if data[i] == '\r' {
+			if i+1 == len(data) && !atEOF {
+				return 0, nil, nil
+			}
+			if i+1 < len(data) && data[i+1] == '\n' {
+				return i + 2, data[:i], nil
+			}
+		}
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // --- inline reasoning --------------------------------------------------------

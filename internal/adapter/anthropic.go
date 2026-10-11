@@ -304,8 +304,10 @@ func (a anthropicAdapter) Chat(ctx context.Context, client *http.Client, p Provi
 		}
 		result.StreamFallbackReason = "the endpoint answered with " +
 			fallbackContentType(response.Header.Get("Content-Type")) + " instead of an event stream"
+		// Delivery may fail before the usage event reaches the gateway. The
+		// generation already completed, so its cost must survive that failure.
 		if err := emitAll(sink, result); err != nil {
-			return Result{}, err
+			return result, err
 		}
 		return result, nil
 	}
@@ -444,6 +446,8 @@ func (anthropicAdapter) readStream(ctx context.Context, response *http.Response,
 		}
 
 		switch event.Type {
+		case "message_stop":
+			return errEventStreamDone
 		case "content_block_start":
 			if event.ContentBlock.Type == "tool_use" && event.ContentBlock.Name != "" {
 				pending[event.Index] = &ToolCall{
